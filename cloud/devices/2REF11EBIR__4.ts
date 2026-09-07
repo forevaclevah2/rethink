@@ -20,22 +20,38 @@ import { convertFreezerTemperature, convertFridgeTemperature, TemperatureUnit } 
 //   00FFFFFF01FF00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF007890BB
 //   frame 71 B, declared len 0x47, checksum 0x90 verified, inner 67 B -> body 65 B
 //
-// Decoded from that capture (all values physically sensible, LG factory defaults):
-//   [1]  fridgeSetpoint  = 7    -> 37 °F (44 - 7)
-//   [2]  freezerSetpoint = 9    -> -3 °F (6 - 9)
-//   [3]  expressFreeze   = 1    -> off (1=off, 2=on)
-//   [7]  anyDoorOpen     = 0    -> closed
-//   [8]  tempUnit        = 0    -> Fahrenheit
-//   [10] displayLock     = 1    -> unlocked
-//   [13] convertibleTemp = 0xFF -> N/A: this is a 3-door, it has no flex drawer
+// Fields this model actually populates (everything else comes back 0xFF):
+//   [0]  monStatus       2      [10] displayLock      1  unlocked (1=unlocked 2=locked)
+//   [1]  fridgeSetpoint  7   -> 37 °F   [14] sabbathMode  0  off
+//   [2]  freezerSetpoint 9   -> -3 °F   [17] smartCare    0
+//   [3]  expressFreeze   1      off     [25] craftIce     2
+//   [4]  freshAirFilter  2              [26] monDataNumber 0
+//   [5]  smartSaving     2
+//   [6]  waterFilter     6
+//   [7]  anyDoorOpen     0      closed
+//   [8]  tempUnit        0      Fahrenheit
+//   [9]  smartSavingRun  0
+// Absent on this model (0xFF): activeSaving, ecoFriendly, convertibleTemp (no flex
+// drawer — it is a 3-door), dualFridge, expressCool, drawerMode, pantryMode,
+// voiceMode, dispenserMode/Capacity/Unit, selfCare.
 //
 // DELIBERATELY READ-ONLY. Reads are verified against the real appliance; writes
-// are NOT. 2REF11EIDA__4 commands with a 0x69-length F017 frame sized for its
-// 68-byte layout, and this model's write frame length is unknown. Sending a
-// wrong-length F017 to a refrigerator could silently move setpoints, so the
-// setpoints are exposed as sensors rather than numbers until an F017 round-trip
-// has actually been observed on this model. See docs/2REF11EBIR__4.md to enable
-// control once verified.
+// are NOT. F017 is a server-to-device command and the appliance never emits one,
+// so the correct command-frame length for this model cannot be learned by
+// observation. Note that F017 length does not track status-body length either:
+// 2REF11EIDA__4 has a 68-byte status and a 105-byte command, while 2REF11EBIVPC4
+// has a 43-byte status and a 124-byte command. Sending a wrong-length F017 to a
+// refrigerator could silently move setpoints, so nothing here advertises a
+// command topic. See docs/2REF11EBIR__4.md for a safe bring-up order.
+
+// Raw counters whose exact scale is not documented anywhere we can verify. They
+// are published as diagnostics with their raw byte value rather than being given
+// an invented unit or mapping.
+const RAW_DIAGNOSTICS: ReadonlyArray<{ prop: string; index: number; name: string; icon: string }> = [
+    { prop: 'water_filter', index: 6, name: 'Water filter', icon: 'mdi:water-check' },
+    { prop: 'fresh_air_filter', index: 4, name: 'Fresh air filter', icon: 'mdi:air-filter' },
+    { prop: 'craft_ice', index: 25, name: 'Craft ice', icon: 'mdi:ice-cream' },
+]
 
 export default class Device extends AABBDevice {
     readonly deviceConfig: DeviceDiscovery
@@ -56,6 +72,8 @@ export default class Device extends AABBDevice {
         if (this.temperatureUnit === unit) return
 
         this.temperatureUnit = unit
+        const degrees = unit === 'F' ? '°F' : '°C'
+
         this.setConfig(
             allowExtendedType({
                 ...this.deviceConfig,
@@ -66,7 +84,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-fridge_setpoint',
                         state_topic: '$this/fridge_setpoint',
                         name: 'Fridge temperature',
-                        unit_of_measurement: unit === 'F' ? '°F' : '°C',
+                        unit_of_measurement: degrees,
                     },
                     freezer_setpoint: {
                         platform: 'sensor',
@@ -74,7 +92,7 @@ export default class Device extends AABBDevice {
                         unique_id: '$deviceid-freezer_setpoint',
                         state_topic: '$this/freezer_setpoint',
                         name: 'Freezer temperature',
-                        unit_of_measurement: unit === 'F' ? '°F' : '°C',
+                        unit_of_measurement: degrees,
                     },
                     door: {
                         platform: 'binary_sensor',
@@ -90,6 +108,33 @@ export default class Device extends AABBDevice {
                         state_topic: '$this/express_freeze',
                         name: 'Express Freeze',
                     },
+                    sabbath_mode: {
+                        platform: 'binary_sensor',
+                        icon: 'mdi:candle',
+                        unique_id: '$deviceid-sabbath_mode',
+                        state_topic: '$this/sabbath_mode',
+                        name: 'Sabbath mode',
+                    },
+                    display_lock: {
+                        platform: 'binary_sensor',
+                        device_class: 'lock',
+                        unique_id: '$deviceid-display_lock',
+                        state_topic: '$this/display_lock',
+                        name: 'Control panel lock',
+                    },
+                    ...Object.fromEntries(
+                        RAW_DIAGNOSTICS.map(({ prop, name, icon }) => [
+                            prop,
+                            {
+                                platform: 'sensor',
+                                entity_category: 'diagnostic',
+                                icon,
+                                unique_id: `$deviceid-${prop}`,
+                                state_topic: `$this/${prop}`,
+                                name,
+                            },
+                        ]),
+                    ),
                 },
             }),
         )
@@ -110,7 +155,7 @@ export default class Device extends AABBDevice {
         // 10EB: [initial status]. Observed at exactly STATUS_LENGTH.
         // Matched on a range rather than equality so a firmware update that pads or
         // trims a byte degrades to "some fields missing" instead of going silent —
-        // unpackStatus/processStatus already tolerate a short buffer.
+        // processStatus already skips anything past the end of the buffer.
         if (buf[1] === 0xeb && body.length >= 34) {
             this.processStatus(body)
             return
@@ -124,19 +169,42 @@ export default class Device extends AABBDevice {
         }
     }
 
+    // 0xFF means "not supported on this model", and a short buffer means the field
+    // is not present at all. Both are left unpublished so the entity stays unknown
+    // rather than reporting a fabricated value.
+    private field(status: Buffer, index: number) {
+        if (index >= status.length) return undefined
+        const v = status[index]
+        return v === 0xff ? undefined : v
+    }
+
     processStatus(curStatus: Buffer) {
         // Field order is fridge_common.STATUS_FIELDS; see the capture above.
         const unit: TemperatureUnit = curStatus[8] ? 'C' : 'F'
         this.setTemperatureUnit(unit)
 
-        this.publishProperty('fridge_setpoint', convertFridgeTemperature(unit, curStatus[1]))
-        this.publishProperty('freezer_setpoint', convertFreezerTemperature(unit, curStatus[2]))
-        this.publishProperty('door', curStatus[7] === 1 ? 'ON' : 'OFF')
+        const fridge = this.field(curStatus, 1)
+        if (fridge !== undefined) this.publishProperty('fridge_setpoint', convertFridgeTemperature(unit, fridge))
 
-        // 0xFF means "not supported on this model" — leave the entity unknown rather
-        // than reporting a fabricated OFF.
-        if (curStatus[3] !== 0xff) {
-            this.publishProperty('express_freeze', curStatus[3] === 2 ? 'ON' : 'OFF')
+        const freezer = this.field(curStatus, 2)
+        if (freezer !== undefined) this.publishProperty('freezer_setpoint', convertFreezerTemperature(unit, freezer))
+
+        const door = this.field(curStatus, 7)
+        if (door !== undefined) this.publishProperty('door', door === 1 ? 'ON' : 'OFF')
+
+        const expressFreeze = this.field(curStatus, 3)
+        if (expressFreeze !== undefined) this.publishProperty('express_freeze', expressFreeze === 2 ? 'ON' : 'OFF')
+
+        const sabbath = this.field(curStatus, 14)
+        if (sabbath !== undefined) this.publishProperty('sabbath_mode', sabbath === 1 ? 'ON' : 'OFF')
+
+        // 1=unlocked, 2=locked (per 2REF11EIDA__4). ON means locked, to match device_class 'lock'.
+        const displayLock = this.field(curStatus, 10)
+        if (displayLock !== undefined) this.publishProperty('display_lock', displayLock === 2 ? 'ON' : 'OFF')
+
+        for (const { prop, index } of RAW_DIAGNOSTICS) {
+            const v = this.field(curStatus, index)
+            if (v !== undefined) this.publishProperty(prop, v)
         }
     }
 }

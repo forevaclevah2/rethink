@@ -61,6 +61,54 @@ describe('2REF11EBIR__4', () => {
         assert.equal(props.freezer_setpoint, -3) // 6 - 9
         assert.equal(props.door, 'OFF')
         assert.equal(props.express_freeze, 'OFF')
+        assert.equal(props.sabbath_mode, 'OFF') // [14] = 0
+        assert.equal(props.display_lock, 'OFF') // [10] = 1 -> unlocked
+        assert.equal(props.water_filter, 6) // [6] raw
+        assert.equal(props.fresh_air_filter, 2) // [4] raw
+        assert.equal(props.craft_ice, 2) // [25] raw
+    })
+
+    test('sabbath mode on is reported', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', initial(mutate(STATUS_REAL, 14, 0x01)))
+        assert.equal(ha.devices[DEVICE_ID].properties.sabbath_mode, 'ON')
+    })
+
+    test('control panel lock reports ON when locked', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', initial(mutate(STATUS_REAL, 10, 0x02)))
+        assert.equal(ha.devices[DEVICE_ID].properties.display_lock, 'ON')
+    })
+
+    test('0xFF diagnostics are left unpublished rather than reported as 255', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', initial(mutate(mutate(STATUS_REAL, 6, 0xff), 25, 0xff)))
+        const props = ha.devices[DEVICE_ID].properties
+        assert.equal(props.water_filter, undefined)
+        assert.equal(props.craft_ice, undefined)
+        assert.equal(props.fresh_air_filter, 2) // still present
+    })
+
+    test('every published component is read-only (no command_topic anywhere)', () => {
+        const { ha, thinq } = makeDevice()
+        thinq.emit('data', SAMPLE_REAL_INITIAL)
+        const comps = ha.devices[DEVICE_ID].config!.components
+        for (const [name, comp] of Object.entries(comps)) {
+            assert.equal(
+                (comp as Record<string, unknown>).command_topic,
+                undefined,
+                `${name} must not advertise a command topic while writes are unverified`,
+            )
+        }
+    })
+
+    test('a status body truncated below the diagnostics still publishes what it has', () => {
+        const { ha, thinq } = makeDevice()
+        const short = STATUS_REAL.slice(0, 40 * 2) // 40 bytes: craft_ice at [25] present, nothing past 39
+        thinq.emit('data', buf('AA2C10EB' + short + '00BB'))
+        const props = ha.devices[DEVICE_ID].properties
+        assert.equal(props.fridge_setpoint, 37)
+        assert.equal(props.craft_ice, 2)
     })
 
     test('publishes Fahrenheit units for this US model', () => {
