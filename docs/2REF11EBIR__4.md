@@ -89,13 +89,41 @@ are published as `sensor`, not `number`, and no command topics are advertised.
 
 ### Enabling control later
 
-1. Change a setting on the fridge's own front panel.
-2. Watch the add-on log for an `F017` frame emitted by the appliance.
-3. Note its total length and which byte changed.
-4. Only then port `setProperty` from `2REF11EIDA__4`, adjusting the template
-   length to match what the appliance actually sends.
+Note that `F017` is a **server-to-device command**. The appliance never emits one,
+so it cannot be learned by watching the log while pressing buttons on the panel.
+(An earlier revision of this document said otherwise; that was wrong.)
 
-Do not guess the length.
+What the two known templates actually look like:
+
+| Model | Status body | F017 frame | Length byte |
+|---|---|---|---|
+| `2REF11EIDA__4` | 68 B | 105 B | `0x69` |
+| `2REF11EBIVPC4` | 43 B | 124 B | `0x7C` |
+
+Two things follow. First, **F017 length does not track status-body length** — the
+model with the larger status block has the shorter command frame. So the 65-byte
+status body here implies nothing about the correct command length. Second, the two
+templates share a **byte-identical 101-byte prefix**; EBIVPC4 is IDA's template
+with 19 further bytes appended. Every field worth controlling here ([1] fridge,
+[2] freezer, [3] express freeze, [8] unit, [14] sabbath) lives inside that shared
+prefix.
+
+Semantics are a write mask: `0xFF` means "leave this field alone", any other value
+means "set it".
+
+Suggested order of work:
+
+1. Send `2REF11EIDA__4`'s 105-byte template **completely unmodified** — an all-mask
+   no-op that should change nothing. Watch for a `10EC` status delta in reply.
+2. If the device answers and the reported status is unchanged, the frame shape is
+   accepted and the template is usable.
+3. Then wire up one low-consequence field first (`display_lock` or `express_freeze`),
+   confirm the status echoes the change, and only afterwards expose the setpoints.
+
+Residual risk, stated honestly: the template carries a few fixed non-`0xFF` bytes.
+If this model's parser expects a different layout, those could land on the wrong
+fields. That is why step 1 sends the frame unmodified and step 3 starts with a
+setting whose worst case is cosmetic rather than a temperature change.
 
 ## If upstream changes break this
 
